@@ -5,7 +5,7 @@
 
 #include "common.h"
 #include "ptx_functions.cuh"
-
+#include "swizzling.cuh"
 
 namespace flash {
 
@@ -90,11 +90,13 @@ __forceinline__ __device__ constexpr void copy_block_GSM(
         for (int c = 0; c < col_fragments_per_row;
              c += col_fragments_per_iter) {
             const int col_fragment = c + thread_col_fragment;
+            // Apply swizzling to prevent bank conflicts during later column-wise access in `ldmatrix`.
+            const int smem_col = get_swizzled_col(cur_row, col_fragment * COLS_PER_FRAGMENT);
  
             op()(&gmem[cur_row * gmem_seq_stride +
                        col_fragment * COLS_PER_FRAGMENT],
                  &smem[cur_row * CFG.smem_cols +
-                       col_fragment * COLS_PER_FRAGMENT]);
+                       smem_col]);
         }
     }
 }
@@ -122,9 +124,11 @@ __forceinline__ __device__ constexpr void copy_warp_fragment_SM2RF(
         #pragma unroll
         for (int c = 0; c < CFG.RF.col_fragments; c += col_fragments_per_iter) {
             const int smem_col_fragment = thread_col_fragment + c + col_fragment_offset;
+            // Use swizzled addresses to match the layout from GMEM→SMEM transfers
+            const int smem_col = get_swizzled_col(cur_row, smem_col_fragment * ELEMS_PER_VEC4_ACCESS);
  
             ldmatrix_x4(&smem[cur_row * CFG.smem_cols +
-                              smem_col_fragment * ELEMS_PER_VEC4_ACCESS],
+                        smem_col],
                         regs[r][c], regs[r + 1][c], regs[r][c + 1],
                         regs[r + 1][c + 1]);
         }
@@ -154,10 +158,11 @@ __forceinline__ __device__ constexpr void copy_warp_fragment_transposed_SM2RF(
         #pragma unroll
         for (int c = 0; c < CFG.RF.row_fragments; c += col_fragments_per_iter) {
             const int smem_col_fragment = thread_col_fragment + c;
+            const int smem_col = get_swizzled_col(cur_row, smem_col_fragment * ELEMS_PER_VEC4_ACCESS);
  
             ldmatrix_x4_transpose(
                 &smem[cur_row * CFG.smem_cols +
-                      smem_col_fragment * ELEMS_PER_VEC4_ACCESS],
+                      smem_col],
                 regs[c][r], regs[c][r + 1], regs[c + 1][r], regs[c + 1][r + 1]);
         }
     }
@@ -183,11 +188,12 @@ __forceinline__ __device__ constexpr void copy_warp_fragment_RF2SM(
         #pragma unroll
         for (int c = 0; c < CFG.RF.col_fragments; c += col_fragments_per_iter) {
             const int smem_col_fragment = c;
+            // Apply swizzling to maintain consistent layout for later SMEM→GMEM transfers
+            const int smem_col = get_swizzled_col(cur_row, smem_col_fragment * ELEMS_PER_VEC4_ACCESS + thread_inner_col);
  
             reinterpret_cast<uint32_t *>(
                 &smem[cur_row * CFG.smem_cols +
-                      (smem_col_fragment * ELEMS_PER_VEC4_ACCESS +
-                       thread_inner_col)])[0] = regs[r][c];
+                      smem_col])[0] = regs[r][c];
         }
     }
 }
