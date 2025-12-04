@@ -77,36 +77,66 @@ __forceinline__ __device__ constexpr void warp_fragment_mma_f32_accum(
 }
 
 template <typename GEMM>
-__device__ constexpr void matmul(typename GEMM::A_t &A, typename GEMM::B_t &B,
-                                 typename GEMM::C_t &C) {
-    // If ::load_entire_block_into_rf is set for either A_t or B_t, then
+__forceinline__ __device__ constexpr void matmul(
+	typename GEMM::A_t &A,
+	typename GEMM::B_t &B,
+    typename GEMM::C_t &C) {
+    // If tensor_t::load_entire_block_into_rf is set for either A_t or B_t, then
     // we assume the block has already been loaded.
     using A_t = typename GEMM::A_t; // Q or P
     using B_t = typename GEMM::B_t; // K or V
-
+    using value_t = typename GEMM::value_t;
+ 
     constexpr int fragments_per_iter = 2;
+ 
+	// This is 1 for Q and 0 for P. 
+    constexpr int A_stage_toggle = A_t::mma_load_stages - 1; 
+    constexpr int B_stage_toggle = B_t::mma_load_stages - 1; // 1 for K & V
+ 
+    int A_stage = 0;
+    int B_stage = 0;
+ 
+    // True for Q, False for P (calculated & stored in RF)
+    if constexpr (GEMM::DoubleBufferA) {
+        A.copy_SM2RF(A_stage); // copy first Q sub-tile
+    }
+    if constexpr (GEMM::DoubleBufferB) {
+        B.copy_SM2RF(B_stage); // copy first K or V sub-tile
+    }
 
+ 
     // GEMM::TotalKFragments is
     // - d_head / 8 for QK^T
     // - B_c / 8    for PV
     #pragma unroll
-    for (int k = 0; k < GEMM::TotalKFragments; k += fragments_per_iter) {
-		// Load fragments along K dimension (2 at a time)
-		// Q is pre-loaded, P is computed in RF - only load if needed
-		if constexpr (!A_t::load_entire_block_into_rf) {
-			A.copy_SM2RF(k);  // Load Q fragments from SMEM
-		}
-		// Always load K/V fragments from SMEM (2 fragments per iteration)
-		B.copy_SM2RF(k);
+    for (int k_outer_fragment = 0; k_outer_fragment < GEMM::TotalKTiles;
+         k_outer_fragment += GEMM::LoadKTilesPerIter) {
+        if constexpr (!A_t::load_entire_block_into_rf ||
+                      !B_t::load_entire_block_into_rf) {
+            int k_load_fragment =
+                k_outer_fragment +
+                (GEMM::DoubleBuffer ? GEMM::LoadKTilesPerIter : 0);
+            if (k_load_fragment < GEMM::TotalKTiles) {
+                if constexpr (!A_t::load_entire_block_into_rf) {
+                    A.copy_SM2RF(A_stage_toggle ^ A_stage, k_load_fragment);
+                }
+                if constexpr (!B_t::load_entire_block_into_rf) {
+                    B.copy_SM2RF(B_stage_toggle ^ B_stage, k_load_fragment);
+                }
+            }
+        }
 
-		// Calculate column offsets for accessing the right fragment data
-        int A_col_offset = A_t::load_entire_block_into_rf ? k : 0;
-        int B_col_offset = B_t::load_entire_block_into_rf ? k : 0;
+        // Perform tile-wise outer products.
+        int A_col_offset =
+            A_t::load_entire_block_into_rf ? k_outer_fragment : 0;
+        int B_col_offset =
+            B_t::load_entire_block_into_rf ? k_outer_fragment : 0;
+        warp_fragment_mma_f32_accum<value_t>(A.data(A_stage), B.data(B_stage),
+                                             C.data(), A_col_offset,
+                                             B_col_offset);
 
-        // Perform outer product: each A row × each B column
-        // This gives optimal fragment reuse compared to row-by-row approach
-        warp_fragment_mma_f32_accum(A.data(), B.data(), C.data(),
-                                    A_col_offset, B_col_offset);
+        A_stage ^= A_stage_toggle;
+        B_stage ^= B_stage_toggle;
     }
 }
 }
