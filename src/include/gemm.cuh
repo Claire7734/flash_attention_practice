@@ -37,10 +37,7 @@ struct GEMM {
     static constexpr bool DoubleBuffer = DoubleBufferA || DoubleBufferB;
 };
 
-// warp_fragment_mma_f32_accum
-// A has shape (M, 2, tiles)
-// B has shape (N, 2, tiles)
-// C has shape (M, N, 1)
+// split along K dimension
 template <typename value_t, const int M_fragments, const int N_fragments,
           const int K_fragments_A, const int K_fragments_B,
           typename accum_t = float>
