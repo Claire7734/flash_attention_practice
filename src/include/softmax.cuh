@@ -50,19 +50,25 @@ calc_row_max(
     }
 }
 
-template <int QO_fragments, int d_head_accum_fragments,
+template <bool optimized_softmax, int QO_fragments, int d_head_accum_fragments,
           typename accum_t = float>
 __forceinline__ __device__ constexpr void
 scale_l_O(
 	accum_t (&m_next)[QO_fragments],
 	accum_t (&m_cur)[QO_fragments],
     accum_t (&l)[QO_fragments],
-    accum_t (&O_accum)[QO_fragments][d_head_accum_fragments]
+    accum_t (&O_accum)[QO_fragments][d_head_accum_fragments],
+    accum_t softmax_scale
 ) {
     #pragma unroll
     for (int q = 0; q < QO_fragments; ++q) {
         accum_t scale;
-        scale = expf(m_cur[q] - m_next[q]);
+        if constexpr (optimized_softmax) {
+            scale = exp2f((m_cur[q] - m_next[q]) * softmax_scale);
+        } else {
+            scale = expf(m_cur[q] - m_next[q]);
+        }
+
         m_cur[q] = m_next[q];
         l[q] *= scale;
         for (int d_head = 0; d_head < d_head_accum_fragments; ++d_head) {
@@ -71,18 +77,28 @@ scale_l_O(
     }
 }
 
-template <int QO_fragments, int KV_accum_fragments,
+template <bool optimized_softmax, int QO_fragments, int KV_accum_fragments,
           typename accum_t = float>
 __forceinline__ __device__ constexpr void
 exponentiate_tensor(
 	accum_t (&S_accum)[QO_fragments][KV_accum_fragments],
-    accum_t (&m)[QO_fragments]
+    accum_t (&m)[QO_fragments],
+    accum_t softmax_scale
 ) {
     #pragma unroll
     for (int q = 0; q < QO_fragments; ++q) {
+        accum_t max_scaled;
+        if constexpr (optimized_softmax) {
+            max_scaled = m[q] * softmax_scale;
+        }
         #pragma unroll
         for (int k = 0; k < KV_accum_fragments; ++k) {
-            S_accum[q][k] = expf(S_accum[q][k] - m[q]);
+            if constexpr (optimized_softmax) {
+                S_accum[q][k] =
+                    exp2f(S_accum[q][k] * softmax_scale - max_scaled);
+            } else {
+                S_accum[q][k] = expf(S_accum[q][k] - m[q]);
+            }
         }
     }
 }

@@ -88,7 +88,8 @@ flash_forward_kernel(__grid_constant__ const ForwardKernelArgs args) {
     O_accum.zero();
  
     // Initialize softmax_scale, m, and l.
-    const accum_t softmax_scale = rsqrt(static_cast<accum_t>(Kernel::d_head));
+    const accum_t softmax_scale = rsqrt(static_cast<accum_t>(Kernel::d_head)) *
+                                  (Kernel::optimized_softmax ? M_LOG2E : 1.0);
     constexpr accum_t neg_inf = -cuda::std::numeric_limits<float>::infinity();
     accum_t m[N::QO_fragments_per_warp];
     accum_t l[N::QO_fragments_per_warp];
@@ -159,10 +160,14 @@ flash_forward_kernel(__grid_constant__ const ForwardKernelArgs args) {
  
         // Online softmax
         accum_t m_next[N::QO_fragments_per_warp];
-        scale_S_accum(S_accum.data(), softmax_scale);
+        if constexpr (!Kernel::optimized_softmax) {
+            scale_S_accum(S_accum.data(), softmax_scale);
+        }
         calc_row_max(S_accum.data(), m_next, m);
-        scale_l_O(m_next, m, l, O_accum.data());
-        exponentiate_tensor(S_accum.data(), m_next);
+        scale_l_O<Kernel::optimized_softmax>(m_next, m, l, O_accum.data(),
+                                             softmax_scale);
+        exponentiate_tensor<Kernel::optimized_softmax>(S_accum.data(), m_next,
+                                                       softmax_scale);
         update_row_exp_sum(S_accum.data(), l);
  
         // Convert the S accumulator block into P bf16/fp16 input block.
