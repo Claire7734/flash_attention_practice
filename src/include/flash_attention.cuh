@@ -38,17 +38,28 @@ struct FlashForwardKernelConfig {
     const int B_c;     // [32, 64, 128]
     const int n_warps; // [4, 8]. 8 only when B_r = 128
 
+    // always true
     const bool async_copy;
-    // If true, load K and V block tiles into smem as soon as we can.
+    // Kernel #3: If true, load K and V block tiles into smem as soon as we can.
     const bool eager_load_blocks;
+
+    // Kernel #2
     const bool swizzled;
 
+    // Kernel #4
+    // This can be either 0 or 2.
+    // If it is:
+    // - 0: load the entire tile into the RF at once before executing any matmuls
+    //   - additionally for Q, persist without reloading.
+    // - 2: load sub-tiles 2 fragments wide at a time
     const int Q_mma_load_K_fragments;
     const int K_mma_load_K_fragments;
     const int V_mma_load_K_fragments;
 
-    // if true, call ldmatrix for the next iter before calling mma.
+    // Kernel #5: if true, call ldmatrix for the next iter before calling mma.
     const bool mma_double_buffer_loads;
+
+    // Kernel #6: fusing FP multiplication and addition instructions
     const bool optimized_softmax;
 
     int smem_bytes(int elem_size = 2) const {
