@@ -36,7 +36,11 @@ python tools/debug/sanity_check.py
 ### Benchmarking
 
 ```bash
+# On RTX3090
 export KERNELS="64,64"
+# On A100
+export KERNELS="128,64"
+
 seq_lens="${1:-1024,2048,4096}"
 
 python tools/benchmark/pt_bench.py \
