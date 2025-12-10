@@ -6,18 +6,16 @@
 
 namespace flash {
 
-template <bool async>
-__device__ void cp_async_commit() {
-    if constexpr (async) {
-        asm volatile("cp.async.commit_group;");
-    }
+FA_DEVICE void cp_async_commit() { asm volatile("cp.async.commit_group;"); }
+
+template <int ngroups>
+FA_DEVICE void cp_async_wait() {
+    asm volatile("cp.async.wait_group %0;" ::"n"(ngroups));
 }
 
-template <int ngroups, bool async>
-__device__ void cp_async_wait() {
-    if constexpr (async) {
-        asm volatile("cp.async.wait_group %0;" ::"n"(ngroups));
-    }
+FA_DEVICE void cp_async_commit_and_wait_all() {
+    cp_async_commit();
+    cp_async_wait<0>();
 }
 
 template <int size, typename T>
