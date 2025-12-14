@@ -183,11 +183,11 @@ LDST操作整理：
 
 ##### GMEM <- SMEM
 
-  Ampere不支持与`cp.async`对称的`st.async`。因此使用16B向量化存储，如下。
+Ampere不支持与`cp.async`对称的`st.async`。因此使用16B向量化存储，如下。
 
-  ```
-  reinterpret_cast<uint4*>(GMEM[dst])[0] = reinterpret_cast<uint4*>(SMEM[src])[0];
-  ```
+```
+reinterpret_cast<uint4*>(GMEM[dst])[0] = reinterpret_cast<uint4*>(SMEM[src])[0];
+```
 
 #### SMEM -> RF 
 
@@ -246,14 +246,17 @@ Amphere不支持`stmatrix`，使用非向量化的4B `smem[dst] = rf[src];`硬�
 回顾之前的数据加载方式：
 
 * SMEM -> RF
+  
   使用`ldmatrix`指令，同组的8个线程同时加载同列的8行数据，造成**8-way bank conflicts**。
   ![alt text](image-21.png)
 
 * RF -> SMEM
+  
   没有使用向量化加载，一个warp中的32个thread同时加载一个(8, 8)的fragment，造成**8-way bank conflicts**。
   ![alt text](image-23.png)
   
 * GMEM <-> SMEM
+  
   同组的8个线程同时加载1个cache line的128B数据，没有bank conflicts。
   ![alt text](image-22.png)
 
@@ -313,9 +316,10 @@ r\c  0  1  2  3
 
   在之前的设计中，一个warp中的32个thread合作搬运一个(8, 8) fragment，每个thread负责4B，一行16B由四个thread负责。这一行的row address被这四个thread共享。因此，可以将一行四个元素打包，通过swizzling共享的当前行的*row base address*，实现与上述向量化swizzling相同的layout。
 
-![alt text](image-25.png)
+  ![alt text](image-25.png)
 
 Swizzling的代码如下：
+
 ```
 __forceinline__ __device__ constexpr int get_swizzled_col(const int &row, const int &col) {
     // Restrict the swizzled column to the
@@ -355,9 +359,9 @@ __forceinline__ __device__ constexpr int get_swizzled_col(const int &row, const 
 原因在于上面的swizzle的写法直白，但写得不够“好”，不够好到让编译器轻松优化：
 
   * 在**每次迭代**中，即使base addr被share了，几乎所有的addr offsets在都会被重新计算
-  * 编译器不能很好得总结swizzling规律，从而优化代码（人脑都很难理解Swizzling，更何况编译器）
+  * 编译器不能很好地总结swizzling规律，从而优化代码（人脑都很难理解Swizzling，更何况编译器）
 
-**解决方案**：找到swizzling的静态规律，并按照这个规律写代码，使编译器可以cache offsets，而不要每次迭代都重新计算offsets。
+**解决方案**：找到swizzling的静态规律，并按照这个规律写代码，使编译器可以cache offsets，而不要每次迭代都重新计算offset。
 
 下面的代码是最终使用的Swizzling function:
 ```
@@ -387,7 +391,6 @@ CuTe的[`class Swizzle`](https://github.com/NVIDIA/cutlass/blob/b0e09d7cd371eded
 #### Swizzling Patterns & Strided Swizzling
 
 重新观察一下应用XOR的Swizzle方阵：
-
 
 (4, 4):
 | irow\icol | 0 | 1 | 2 | 3 |
@@ -447,15 +450,34 @@ CuTe的[`class Swizzle`](https://github.com/NVIDIA/cutlass/blob/b0e09d7cd371eded
 | 6      | (-4, -2, 1)| 6           |
 | 7      | (-4, -2, -1)| 7          |
 
+
+##### 利用地址位与bank的关系做swizzling
+
+在128B cache line align的情况下，由于访问内存规则是以16B为单位的，因此row addr有以下规律：
+
+* **Bits 0-3**永远为0，因为16B alignment
+* **Bits 2-6**决定了以4B为单位的bank index。因为16B alignment访问模式，因此只需要关注**bits 4-6**的8个bank
+* 当行步长为128B时，移动到下一行意味着**bit 7**增加1，而**bits 0-6**仍重复上述规律
+
+也就是说，对于原始的`arr[row][row XOR col]`变换方式：利用row addr的**bits 4-6**可以确定`col`，也就是在一个128B的cache line上归属的bank序号；而对于`row`，每个thread在启动时已经被指定了相应的row index，由于一共有8个bank，所以只需要关注**bits 0-2**。因此，通过row addr的bits 4-6 XOR row index 的bits 0-2，就可以避免bank conflicts了。
+
+事实上，完全依靠row addr也可以完成相应的swizzle。如下所示，对于一个8 x 128B的tile，row addr的`bits 7-9`即表示相应的row index；当stride = 16B时，col bank由**bits 4-6**确定。合理利用位移运算和异或运算，即可算出避免bank confclit的offset。
+
+```
+地址分解：
+bit[31:10] - 更高位的地址（跨多个8行块）
+bit[9:7]   - 在8行块内的行索引（0-7）
+bit[6:0]   - 行内偏移（128字节内）
+  bit[6:4] - 128B行上的列偏移（以16B为stride的bank序号）
+  bit[0-3] - 16B块内字节偏移
+```
+
 * CuTe
   
-  CuTe设计了写法更烧脑的Strided pattern的offset的计算方式，可以参考[CUDA Shared Memory Swizzling](https://leimao.github.io/blog/CUDA-Shared-Memory-Swizzling/#CUDA-Shared-Memory-Swizzling)。
+  CuTe设计了写法更通用的Strided pattern的offset的计算方式，如上面代码所示：`template <int BBits, int MBase, int SShift = BBits>`。
 
-  Base idea如下，`k`线程索引：
-  ```
-  offset = base + k * stride
-  swizzled_offset = offset ^ ((offset & mask) >> shift)
-  ```
+  详细数学证明可参考[CUDA Shared Memory Swizzling](https://leimao.github.io/blog/CUDA-Shared-Memory-Swizzling/#CUDA-Shared-Memory-Swizzling)。
+
 
 #### Swizzle Regions
 

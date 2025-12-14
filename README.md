@@ -2,7 +2,7 @@
 
 ## Introduction
 
-A [Flash Attention 2](https://arxiv.org/abs/2307.08691) implementation following the instruction of [Flash Attention From Scratch](https://lubits.ch/flash/).
+A [Flash Attention 2](https://arxiv.org/abs/2307.08691) implementation following the instruction from [Flash Attention From Scratch](https://lubits.ch/flash/).
 
 * Self-learning notes
     1. [数据访问与Swizzling](./docs/1_数据访问与Swizzling.md)
