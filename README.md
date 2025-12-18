@@ -2,10 +2,11 @@
 
 ## Introduction
 
-A [Flash Attention 2](https://arxiv.org/abs/2307.08691) implementation following the instruction from [Flash Attention From Scratch](https://lubits.ch/flash/).
+A [Flash Attention-2](https://arxiv.org/abs/2307.08691) implementation following the instruction from [Flash Attention From Scratch](https://lubits.ch/flash/).
 
 * Self-learning notes
     1. [数据访问与Swizzling](./docs/1_数据访问与Swizzling.md)
+    2. [Flash Attention-2中的计算：GEMM & Softmax](./docs/2_计算GEMM与Softmax.md)
 
 ## Testing
 
