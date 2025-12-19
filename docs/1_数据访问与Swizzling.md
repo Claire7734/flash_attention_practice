@@ -4,7 +4,7 @@
 
 [Flash Attention 2](https://arxiv.org/abs/2307.08691) 算法天然就是为了并行计算设计的。
 
-算法将Q, K和V分别以blcok size为Br, Bc切成tile，然后循环处理每个tile的小矩阵。核心运算包含两个矩阵乘运算(`S = Q x V^T` 和 `O = P x V`)和一个复杂的Online Softmax。因为数据准备和搬运主要涉及Q, K, V和O，所以本节重点关注矩阵乘运算。
+算法将Q, K和V分别以blcok size为Br, Bc切成tile，然后循环处理每个tile的小矩阵。核心运算包含两个矩阵乘运算(`S = Q @ V^T` 和 `O = P @ V`)和一个复杂的Online Softmax。因为数据准备和搬运主要涉及Q, K, V和O，所以本节重点关注矩阵乘运算。
 
 Flash Attention 2 算法定义如下：
 ![alt text](image-1.png)
@@ -17,7 +17,7 @@ Flash Attention 2 算法定义如下：
 
 #### m16n8k16
 
-[`m16n8k16`](https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#warp-level-matrix-fragment-mma-16816-float)指令，顾名思义，完成的是M = 16, N = 8, K = 16的矩阵乘加运算A x B + C = D。
+[`m16n8k16`](https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#warp-level-matrix-fragment-mma-16816-float)指令，顾名思义，完成的是M = 16, N = 8, K = 16的矩阵乘加运算`D = AB + C`。
 
 本文使用的指令如下：
 
@@ -35,7 +35,7 @@ A矩阵，行主序：
 B矩阵，列主序：
 ![alt text](image-3.png)
 
-如上图所示，`m16n8k16`在进行运算时，需要A矩阵按row-major存储，B矩阵按colomn-major存储。那么，当输入的所有矩阵都是row-major存储时，对B来说，colomn-major的访问方式相当于做了一次转置。因此，当A和B矩阵都是row-major的话，`m16n8k16`完成的运算其实是`A x B^T + C = D`。但这引入一个问题，虽然B矩阵内存储元素做了转置，但是维度仍然是N x K，怎么满足`m16n8k16`对B矩阵的维度为K x N的要求。
+如上图所示，`m16n8k16`在进行运算时，需要A矩阵按row-major存储，B矩阵按colomn-major存储。那么，当输入的所有矩阵都是row-major存储时，对B来说，colomn-major的访问方式相当于做了一次转置。因此，当A和B矩阵都是row-major的话，`m16n8k16`完成的运算其实是`D = AB^T + C`。但这引入一个问题，虽然B矩阵内存储元素做了转置，但是维度仍然是(N, K)，怎么满足`m16n8k16`对B矩阵的维度为(K, N)的要求。
 
 再仔细观察上面的矩阵布局，A和B矩阵都被划分成了不同个(8, 8)的小矩阵，这样的(8, 8)的小矩阵本文称之为**fragment**。`m16n8k16`是一个warp级别的操作，所以能看到每个(8, 8) fragment内元素被映射到一个warp中的32个线程。A由(2, 2)维的(8, 8) fragment构成，B由(2, 1)维的(8, 8) fragment构成。
 
@@ -69,7 +69,7 @@ B矩阵，列主序：
 
 ##### ldmatrix.trans
 
-如前文所述，如果输入矩阵A和B的存储方式是row-major的，那么`m16n8k16`完成的运算是`A x B^T + C = D`。这与`S = Q x K^T`相匹配。但是对于`O = P x V`，由于V是非转置的，因此需要通过`ldmatrix.trans`在加载的时候进行转置加载，才能符合`m16n8k16`对于B矩阵的要求。如下图所示，对于thread 0的RF内存储的元素，转置过的V矩阵的第一个fragment，与按行排列的B矩阵的一致。
+如前文所述，如果输入矩阵A和B的存储方式是row-major的，那么`m16n8k16`完成的运算是`AB^T + C = D`。这与`S = Q @ K^T`相匹配。但是对于`O = P @ V`，由于V是非转置的，因此需要通过`ldmatrix.trans`在加载的时候进行转置加载，才能符合`m16n8k16`对于B矩阵的要求。如下图所示，对于thread 0的RF内存储的元素，转置过的V矩阵的第一个fragment，与按行排列的B矩阵的一致。
 
 ![alt text](image-10.png)
 
