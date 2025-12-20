@@ -1,5 +1,16 @@
 # 计算优化总结
 
+观察下面的attention公式，
+
+$$
+\text{Attention}(Q, K, V) = \text{softmax}\left(\frac{QK^T}{\sqrt{d_{\text{head}}}}\right)V
+$$
+
+计算可以被分为两类：
+
+* 矩阵乘法(GEMM)：基于 Tensor Core 做MMA运算，采用 FP16/BF16 精度计算
+* Softmax运算：由 CUDA Core 中的标准浮点单元执行，采用 FP32 精度
+
 ## GEMM
 
 ### 基础版本
@@ -98,3 +109,114 @@ split-K: reduction across CTAs
 
   这里与V矩阵从smem到RF的加载做个比较：同样是交换了(1, 0)和(0, 1) fragment的位置，在smem按row-major存储的K矩阵，由于计算的`S = Q @ K^T`要求K矩阵是转置的，而MMA要求B矩阵为col-major，当通过`ldmatrix`加载后，MMA按col-major的顺序读取row-major存储的(8, 8) fragment，相当于对K矩阵做了转置；而smem按照row-major存储的V矩阵，需要完成的计算是`O = P @ V`，要求V是非转置的，因此需要通过`ldmatrix.trans`加载(8, 8) V的fragment。
 
+
+## Flash Attention's Softmax
+
+### 理论分析
+
+Softmax是深度学习模型最常用的操作之一，基础运算如下面的公式。分母是一个reduce操作(aka `sum`)，在大规模矩阵场景下，单行元素无法完全放入shared memory，需要连续访问global memory，造成IO瓶颈。
+
+Flash Attention通过把softmax改造成分段迭代的形式，显著提高了性能。
+
+$$
+\text{Softmax}(x_i) = \frac{\exp(x_i)}{\sum_{j=0}^{N-1} \exp(x_j)}
+$$
+
+#### Safe Softmax
+  
+在上面的公式中，当x_i是一个较大的正数时，取指数会导致数值溢出。因此，一个safe版本的softmax会先统计一个最大值，再将所有元素减去这个最大值，如下面的公式。这里的max，也是一个reduce操作。
+
+$$x_{max} = \max(x_0, x_1, \dots, x_{N-1})$$
+$$
+\text{Softmax}(x_i) = \frac{\exp(x_i - x_{max})}{\sum_{j=0}^{N-1} \exp(x_j - x_{max})}
+$$
+
+#### Online Softmax
+  
+Online softmax的算法由[Online normalizer calculation for softmax](https://arxiv.org/abs/1805.02867)提出，[Flash Attention 2](https://arxiv.org/abs/2307.08691)利用了其思路完成了对Attention中softmax的分段迭代计算。
+
+所谓online softmax，就是在原长度为`N`的向量的softmax结果的基础上，在线增加新的向量元素，动态求出此时`N + 1`长度向量的softmax结果。
+
+比如针对safe softmax的计算公式：当前序列长度为`N`，当增加一个元素`x_k`时，此时的`x_max`有两个结果，要么是原来的最大值，要么是`x_k`。把前N个元素的最大值记为`m_N`，前N个元素的softmax的分母$\sum_{j=0}^{N-1} \exp(x_j - x_{max})$记为`d_N`，那么，
+
+N+1个元素的最大值$m_{N+1}$为：
+
+$$
+m_{N+1} = \max(m_N, x_N)
+$$
+
+N+1个元素的全局最大值$d_{N+1}$为：
+
+$$
+\begin{aligned}
+d_{N+1} &= \sum_{j=0}^{N} \exp(x_j - m_{N+1}) \\
+&= \sum_{j=0}^{N-1} \exp(x_j - m_{N+1}) + \exp(x_N - m_{N+1}) \\
+&= \sum_{j=0}^{N-1} \exp(x_j - m_N)⋅\exp(m_N - m_{N+1}) + \exp(x_N - m_{N+1}) \\
+&= d_N\exp(m_N - m_{N+1}) + \exp(x_N - m_{N+1})
+\end{aligned}
+$$
+
+可以看出，全局最大值需要在原来的`d_N`基础上补乘一个系数$\exp(m_N - m_{N+1})$做归一化调整；当全局最大值不变时，系数为1。再加上新元素的对应的分量$\exp(x_N - m_{N+1})$。
+
+
+#### Flash Attention-2 forward pass
+
+Online softmax处理的是一个序列x，而在Attention使用softmax计算注意力分数时，处理的是多个向量组成的**矩阵**。也就是说，针对每个查询向量（即Q的每一行），需要计算其与所有键（K的所有行 `[seq_len, d_head]`矩阵）的注意力权重，然后对值（V）加权求和。
+
+![alt text](image-1.png)
+
+如上图Flash Attention-2的算法定义，在内层循环中，每个查询位置（每行）独立计算自己的softmax。对于查询块`i`，KV块`j`，针对查询块`i`中的单个查询q:
+
+$$
+m_q^{(j)} = max(m_q^{(j-1)}, max_over_k(S_{i,q,k}^{(j)}))
+$$
+
+运行时分母为：
+$$
+l_q^{(j)} = exp(m_q^{(j-1)} - m_q^{(j)}) * l_q^{(j-1)} + sum_over_k(exp(S_{i,q,k}^{(j)} - m_q^{(j)}))
+$$
+
+### 算法实现
+
+#### 基础版本
+
+为了保证准确性，softmax的计算精度为32-bit。所需数据都已存在到RF里面，所以不涉及LD/ST操作。
+
+1. 初始化m向量为-inf，l向量为0.0
+2. 将前一步矩阵乘QK^T算出来的分数S缩放，即将S逐元素与$1/\sqrt{d_{head}}$相乘
+3. 通过Warp Shuffle在RF上做reduction来同步`m`，避免访问共享内存
+    * CUDA内置函数，通过"异或"模式交换数据：`__shfl_xor_sync()`
+      
+      `T __shfl_xor_sync(unsigned mask, T var, int xor_offset, int width=warpSize);`
+        * `var`: 要交换的值
+        * `xor_offset`：异或偏移量，thread根据自己的tid，读取`tid ^ xor_offset`，来确定交换伙伴
+        * `mask`: 指定参与交换的线程
+    * Reduction：
+    
+      如下图所示，一个warp处理一个(8, 8)shape的fragment，每行由4个线程处理。Reduction需要让这4个thread充分同步数据。使用异或操作，两两间进行一次信息交换，最小沟通次数为`4 = 2^2`，即2次。
+
+      ![alt text](image-41.png)
+
+      * 规约的三个阶段
+        * 首先，在thread内进行规约，求得当前thread的最大值
+        * 然后，进行warp内的第一次归约 - 第一次异或交换（offset=2）
+          ![alt text](image-42.png)
+        * 最后，进行warp内的第二次归约 - 第二次异或交换（offset=1）
+          ![alt text](image-43.png)
+4. `l`和`Oj`的rescale
+    * 根据reduction得到的`m`，计算相应的`l`和`Oj`
+5. `Sj`求指数
+6. `l`的partial reduction
+    因为l只有到最后需要normalize O时才会被用到，所以现在跳过warp shuffle。只做当前thread的sum。
+7. Softmax Epilogue
+    * 同一行的4个thread之间，通过warp shuffle同步`l`，从而得到最终的`l`
+    * 基于当前block的`l`，normalize `O`
+
+
+#### 优化：Fusing FP Multiplication and Addition in Softmax
+
+在上述的基础版本中，Softmax的运算都是分开进行的。而利用FFMA(fused multiply-add)指令 `d = a * b + c`，可以将多个运算合并起来，从而减少指令数量。
+
+1. 将计算注意力分数的scale运算，逐元素乘系数$\alpha = 1/\sqrt{d_{head}}$，放进Safe attention减去最大值的操作$S_{i}^{(j)} - m^{(j)}$里，变成$\alpha⋅S_{i}^{(j)} - \tilde{m}^{(j)}$，其中$\tilde{m}^{(j)} = \alpha⋅m^{(j)}$
+   
+2. 将`expf(x)`显示地改写成更快的`exp2f(x * log2e)`($e^{x} = 2^{x \cdot \log_{2}e}$)，并提前把常数`log2e`合并到$\alpha$中。更新后，$\alpha = \log_{2}e/\sqrt{d_{head}}$。
