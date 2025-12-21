@@ -7,6 +7,7 @@ A [Flash Attention-2](https://arxiv.org/abs/2307.08691) implementation following
 * Self-learning notes
     1. [数据访问与Swizzling](./docs/1_数据访问与Swizzling.md)
     2. [Flash Attention-2中的计算：GEMM & Softmax](./docs/2_计算GEMM与Softmax.md)
+    3. [Resource Accounting & Profiling Tips](./docs/3_Resource_Accounting_and_Profiling.md)
 
 ## Testing
 
