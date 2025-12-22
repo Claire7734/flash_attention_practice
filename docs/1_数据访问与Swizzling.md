@@ -2,9 +2,7 @@
 
 ## Introduction
 
-[Flash Attention 2](https://arxiv.org/abs/2307.08691) 算法天然就是为了并行计算设计的。
-
-算法将Q, K和V分别以blcok size为Br, Bc切成tile，然后循环处理每个tile的小矩阵。核心运算包含两个矩阵乘运算(`S = Q @ V^T` 和 `O = P @ V`)和一个复杂的Online Softmax。因为数据准备和搬运主要涉及Q, K, V和O，所以本节重点关注矩阵乘运算。
+[Flash Attention 2](https://arxiv.org/abs/2307.08691) 算法将Q, K和V分别以blcok size为Br, Bc切成tile，然后循环处理每个tile的小矩阵。核心运算包含两个矩阵乘运算(`S = Q @ V^T` 和 `O = P @ V`)和一个复杂的Online Softmax。因为数据准备和搬运主要涉及Q, K, V和O，所以本节重点关注矩阵乘运算。
 
 Flash Attention 2 算法定义如下：
 ![alt text](image-1.png)

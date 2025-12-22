@@ -36,11 +36,11 @@ $$
 1. ldmatrix单次拷贝(16, 16)矩阵的元素，然后迭代着依次拷贝下去。在拷贝后面的元素的时候，前面的元素已经准备好了，可以开始计算；
 2. 仔细观察reserve的A shape和B shape，k-dimension很大，对应的是d_head维度。而当B_r或者B_c增加的时候，m和n维度会变大，从而很容易导致register spill。
 
-此处引入cutlass GEMM关于k维度的优化策略。
+此处引入Cutlass GEMM关于k维度的优化策略。
 
-#### cutlass GEMM: spliced-k, split-k & stream-k
+#### Cutlass GEMM: spliced-k & split-k
 
-cutlass GEMM关于K维度的优化策略，主要是针对m/n维度较小而k维度较大的GEMM。
+Cutlass GEMM关于K维度的优化策略，主要是针对m/n维度较小而k维度较大的GEMM。
 
 基本策略是：对于一个大小维`[BM, BN, BK]`维度的work tile，除了沿着M/N维度切分之外，沿着K维度也把任务进行了切分。如此一来，待处理的可并行任务的工作量从`[WM, WN, BK]`变成了`[WM, WN, WK]`，与之相对应的，并行处理任务数量从`[BM/WM, BN/WN, BK]`变成了`[BM/WM, BN/WN, BK/WK]`。
 
@@ -51,8 +51,9 @@ cutlass GEMM关于K维度的优化策略，主要是针对m/n维度较小而k维
 
 这里显示出了spliced-k和split-k由于执行单元的并行化粒度，导致的reduce阶段的复杂性的差异。下面是两者的定义：
 
-sliced-k: reduction across warps on shared memory in CTA
-split-K: reduction across CTAs
+> sliced-k: reduction across warps on shared memory in CTA
+> 
+> split-K: reduction across CTAs
 
 总体来说，sliced-k发生在一个SM上，因此可以通过shared memory进行结果的同步，比如依靠shared memory的一个partial accumulation sums累加结果；而split-K由于设计到跨SM的数据同步，有一些更复杂的规约策略。
 
@@ -73,10 +74,8 @@ split-K: reduction across CTAs
 
 
 * 为什么选择在k维度上切分任务
-  
-  上述cutlass的GEMM优化策略固然好，但我们的case里，MMA是在一个warp上完成的，沿着A/B维度切分，保留完整的K维度，计算的结果也即最终结果，不是很好吗？
 
-  这里还可以通过算存比进行定量分析，假设A有`Fr = 2`个MMA的行fragment，B有`Fc = 8`个MMA的列fragment，那么：
+  通过Arithmetic Intensity进行定量分析：假设A有`Fr = 2`个MMA的行fragment，B有`Fc = 8`个MMA的列fragment，那么：
   
   1. 如下图，按行加载A，按列加载B。为了计算GEMM，A的每行计算，都需要重新加载一遍完整的B：`MMAs performed / Total fragments loads = Fr * Fc / (Fr + Fr * Fc) = 0.89`
     ![alt text](image-37.png)
@@ -137,15 +136,15 @@ Online softmax的算法由[Online normalizer calculation for softmax](https://ar
 
 所谓online softmax，就是在原长度为`N`的向量的softmax结果的基础上，在线增加新的向量元素，动态求出此时`N + 1`长度向量的softmax结果。
 
-比如针对safe softmax的计算公式：当前序列长度为`N`，当增加一个元素`x_k`时，此时的`x_max`有两个结果，要么是原来的最大值，要么是`x_k`。把前N个元素的最大值记为`m_N`，前N个元素的softmax的分母$\sum_{j=0}^{N-1} \exp(x_j - x_{max})$记为`d_N`，那么，
+比如针对safe softmax的计算公式：当前序列长度为`N`，当增加一个元素`x_k`时，此时的`x_max`有两个结果，要么是原来的最大值，要么是`x_k`。把前N个元素的最大值记为`m_N`，前N个元素的softmax的分母 $\sum_{j=0}^{N-1} \exp(x_j - x_{max})$ 记为`d_N`，那么，
 
-N+1个元素的最大值$m_{N+1}$为：
+N+1个元素的最大值 $m_{N+1}$ 为：
 
 $$
 m_{N+1} = \max(m_N, x_N)
 $$
 
-N+1个元素的全局最大值$d_{N+1}$为：
+N+1个元素的全局最大值 $d_{N+1}$ 为：
 
 $$
 \begin{aligned}
@@ -156,7 +155,7 @@ d_{N+1} &= \sum_{j=0}^{N} \exp(x_j - m_{N+1}) \\
 \end{aligned}
 $$
 
-可以看出，全局最大值需要在原来的`d_N`基础上补乘一个系数$\exp(m_N - m_{N+1})$做归一化调整；当全局最大值不变时，系数为1。再加上新元素的对应的分量$\exp(x_N - m_{N+1})$。
+可以看出，全局最大值需要在原来的`d_N`基础上补乘一个系数 $\exp(m_N - m_{N+1})$ 做归一化调整；当全局最大值不变时，系数为1。再加上新元素的对应的分量 $\exp(x_N - m_{N+1})$ 。
 
 
 #### Flash Attention-2 forward pass
@@ -168,12 +167,13 @@ Online softmax处理的是一个序列x，而在Attention使用softmax计算注�
 如上图Flash Attention-2的算法定义，在内层循环中，每个查询位置（每行）独立计算自己的softmax。对于查询块`i`，KV块`j`，针对查询块`i`中的单个查询q:
 
 $$
-m_q^{(j)} = max(m_q^{(j-1)}, max_over_k(S_{i,q,k}^{(j)}))
+m_q^{(j)} = max(m_q^{(j-1)}, maxoverk(S_{i,q,k}^{(j)}))
 $$
 
 运行时分母为：
+
 $$
-l_q^{(j)} = exp(m_q^{(j-1)} - m_q^{(j)}) * l_q^{(j-1)} + sum_over_k(exp(S_{i,q,k}^{(j)} - m_q^{(j)}))
+l_q^{(j)} = exp(m_q^{(j-1)} - m_q^{(j)}) * l_q^{(j-1)} + sumoverk(exp(S_{i,q,k}^{(j)} - m_q^{(j)}))
 $$
 
 ### 算法实现
@@ -183,7 +183,7 @@ $$
 为了保证准确性，softmax的计算精度为32-bit。所需数据都已存在到RF里面，所以不涉及LD/ST操作。
 
 1. 初始化m向量为-inf，l向量为0.0
-2. 将前一步矩阵乘QK^T算出来的分数S缩放，即将S逐元素与$1/\sqrt{d_{head}}$相乘
+2. 将前一步矩阵乘QK^T算出来的分数S缩放，即将S逐元素与 $1/\sqrt{d_{head}}$ 相乘
 3. 通过Warp Shuffle在RF上做reduction来同步`m`，避免访问共享内存
     * CUDA内置函数，通过"异或"模式交换数据：`__shfl_xor_sync()`
       
@@ -217,6 +217,6 @@ $$
 
 在上述的基础版本中，Softmax的运算都是分开进行的。而利用FFMA(fused multiply-add)指令 `d = a * b + c`，可以将多个运算合并起来，从而减少指令数量。
 
-1. 将计算注意力分数的scale运算，逐元素乘系数$\alpha = 1/\sqrt{d_{head}}$，放进Safe attention减去最大值的操作$S_{i}^{(j)} - m^{(j)}$里，变成$\alpha⋅S_{i}^{(j)} - \tilde{m}^{(j)}$，其中$\tilde{m}^{(j)} = \alpha⋅m^{(j)}$
+1. 将计算注意力分数的scale运算，逐元素乘系数 $\alpha = 1/\sqrt{d_{head}}$，放进Safe attention减去最大值的操作 $S_{i}^{(j)} - m^{(j)}$里，变成 $\alpha⋅S_{i}^{(j)} - \tilde{m}^{(j)}$，其中 $\tilde{m}^{(j)} = \alpha⋅m^{(j)}$
    
-2. 将`expf(x)`显示地改写成更快的`exp2f(x * log2e)`($e^{x} = 2^{x \cdot \log_{2}e}$)，并提前把常数`log2e`合并到$\alpha$中。更新后，$\alpha = \log_{2}e/\sqrt{d_{head}}$。
+2. 将`expf(x)`显示地改写成更快的`exp2f(x * log2e)`( $e^{x} = 2^{x \cdot \log_{2}e}$ )，并提前把常数`log2e`合并到 $\alpha$中。更新后， $\alpha = \log_{2}e/\sqrt{d_{head}}$。
