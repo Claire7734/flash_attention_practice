@@ -364,7 +364,7 @@ __forceinline__ __device__ constexpr int get_swizzled_col(const int &row, const 
 下面的代码是最终使用的Swizzling function:
 ```
 // Adapted from https://leimao.github.io/blog/CuTe-Swizzle/.
-template <int BBits = 3, int MBase = 0, int SShift = 3>
+template <int BBits, int MBase, int SShift>
 struct CuteSwizzle {
     static constexpr int mbase = MBase;
     static constexpr int mask_bits = BBits;
@@ -465,16 +465,14 @@ CuTe的[`class Swizzle`](https://github.com/NVIDIA/cutlass/blob/b0e09d7cd371eded
 地址分解：
 bit[31:10] - 更高位的地址（跨多个8行块）
 bit[9:7]   - 在8行块内的行索引（0-7）
-bit[6:0]   - 行内偏移（128字节内）
-  bit[6:4] - 128B行上的列偏移（以16B为stride的bank序号）
+bit[6:0]   - 行内偏移（128B内）
+  bit[6:4] - bank索引 (16B为stride，共8个bank)
   bit[0-3] - 16B块内字节偏移
 ```
 
 * CuTe
   
-  CuTe设计了写法更通用的Strided pattern的offset的计算方式，如上面代码所示：`template <int BBits, int MBase, int SShift = BBits>`。
-
-  详细数学证明可参考[CUDA Shared Memory Swizzling](https://leimao.github.io/blog/CUDA-Shared-Memory-Swizzling/#CUDA-Shared-Memory-Swizzling)。
+  CuTe设计了写法更通用的Strided pattern的[Swizzle](https://github.com/NVIDIA/cutlass/blob/b0e09d7cd371eded41f7c1e057caf1593c27ba55/include/cute/swizzle.hpp#L55)方法`template <int BBits, int MBase, int SShift = BBits>`。详细数学证明可参考[CUDA Shared Memory Swizzling](https://leimao.github.io/blog/CUDA-Shared-Memory-Swizzling/#CUDA-Shared-Memory-Swizzling)。
 
 
 #### Swizzle Regions
@@ -493,7 +491,28 @@ bit[6:0]   - 行内偏移（128字节内）
 之前，每次传输需要根据当前行（即thread）和列，重新计算一遍当前pattern swizzle后的index。现在，传输一个swizzle region，每个线程在迭代时，只需要传入swizzle stride，再依据base offset，应用static swizzle pattern。这样的方式，大大减少了访问smem时计算addr的次数。
 
 
-#### Swizzle Regions的应用
+##### Swizzle Regions的应用
+
+在一个8×128B region内的地址模式，Region内的地址分解：
+
+```
+offset = row * 128 + col * 16 // 16B stride
+
+bit[31:10] - region索引和更高位
+bit[9:7]   - region内行索引 (0-7)  ← 关键！
+bit[6:4]   - bank索引 (16B为单位)
+bit[3:0]   - 16B块内字节偏移
+```
+
+在实现中，本案使用了配置`CuteSwizzle<3, 3, log2(d_head) - log2(ELEMS_PER_VEC4_ACCESS)>;`
+
+  1. BBits (mask_bits) = 3
+     要操作的bit数量，`bit_mask = 0b111`：对应8个bank (2^3 = 8)
+  2. MBase (mbase) = 3
+     掩码基地址的bit位置偏移：访问粒度和对齐调整
+  3. SShift (mask_shift) = 4
+     右移的位数：确保正确对齐到bank索引进行异或
+
 
 ##### GMEM <-> SMEM
 
@@ -513,6 +532,26 @@ bit[6:0]   - 行内偏移（128字节内）
 ![alt text](image-32.png)
 ![alt text](image-33.png)
 ![alt text](image-34.png)
+
+在这里，使用之前总结的Swizzling Patterns，可以通过定义static的swizzle stride，从而计算warp中的每个thread`lane_id = thread_id % 32`swizzle后的index。
+
+```
+// ...
+struct SwizzleStride {
+    int s0; // (always 64, this is for when we cross from one swizzle region to another)
+    int s1; // (+- 32)
+    int s2; // (+- 16)
+ 
+	// The iteration is of the inner loop.
+    constexpr int offset(int iteration) const {
+        int i0 = (iteration >> 2) & 1;
+        int i1 = (iteration >> 1) & 1;
+        int i2 = iteration & 1;
+        return i0 * s0 + i1 * s1 + i2 * s2;
+    }
+};
+// ...
+```
 
 ##### RF -> SMEM
 
