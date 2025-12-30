@@ -162,9 +162,40 @@ $$
 
 Online softmax处理的是一个序列x，而在Attention使用softmax计算注意力分数时，处理的是多个向量组成的**矩阵**。也就是说，针对每个查询向量（即Q的每一行），需要计算其与所有键（K的所有行 `[seq_len, d_head]`矩阵）的注意力权重，然后对值（V）加权求和。
 
-![alt text](image-1.png)
+```
+# attention state
+m = torch.zeros(BLOCK_Q)
+tile_O = torch.zeros(BLOCK_Q, DIM)
+sumexp = torch.zeros(BLOCK_Q)
 
-如上图Flash Attention-2的算法定义，在内层循环中，每个查询位置（每行）独立计算自己的softmax。对于查询块`i`，KV块`j`，针对查询块`i`中的单个查询q:
+for _ in range(Lk // BLOCK_KV):
+  # 1st MMA
+  tile_S = tile_Q @ tile_K.T  # [BLOCK_Q, BLOCK_KV]
+  tile_S = tile_S * scale
+
+  # online softmax
+  tile_max = tile_S.amax(dim=-1)  # [BLOCK_Q]
+  new_m = torch.maximum(m, tile_max)
+  tile_P = torch.exp(tile_S - new_m.unsqueeze(-1))
+
+  # rescale
+  scale = torch.exp(m - new_m)
+  tile_O *= scale.unsqueeze(-1)
+  sumexp = sumexp * scale + tile_P.sum(dim=-1)
+  m = new_m  # save new max
+
+  # 2nd MMA
+  tile_O += tile_P @ tile_V  # [BLOCK_Q, DIM]
+
+# apply normalization
+tile_O /= sumexp.unsqueeze(-1)
+```
+
+上面是Flash Attention-2的pseudo-Python代码，在内层循环中，每个查询位置（每行）独立计算自己的softmax。对于查询块`i`中的单个查询`q`，针对KV块`j`中的单个键`k`:
+
+$$
+S_{i,q,k}^{(j)} = Q_i[q]·K_j[k]^T / sqrt(d)
+$$
 
 $$
 m_q^{(j)} = max(m_q^{(j-1)}, maxoverk(S_{i,q,k}^{(j)}))
