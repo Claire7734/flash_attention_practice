@@ -108,6 +108,7 @@ flash_forward_kernel(__grid_constant__ const ForwardKernelArgs args) {
     value_t *smem_K = &smem_Q[B_r * D_HEAD];
     value_t *smem_V = &smem_K[B_c * D_HEAD];
 
+
     // The number of d_head tiles loaded and operated on by this thread
     // block.
     constexpr int d_head_fragments = D_HEAD / COLS_PER_FRAGMENT;
@@ -188,11 +189,6 @@ flash_forward_kernel(__grid_constant__ const ForwardKernelArgs args) {
     cp_async_wait<1>();
     __syncwarp();
 
-    // Load a sub-tile of Q along k-dimension as MMA_LOAD_FRAGMENTS
-    // QO_fragments_per_warp = 2
-    copy_warp_fragment_SM2RF<QO_fragments_per_warp, MMA_LOAD_FRAGMENTS, D_HEAD, value_t>(
-                rfmatrix_Q.data(), smem_Q + QO_warp_seq * D_HEAD, lane_id);
-
     for (int kv_id = 0; kv_id < num_kv_iter; ++kv_id) {
 
         rfmatrix_S_accum.zero();
@@ -205,46 +201,22 @@ flash_forward_kernel(__grid_constant__ const ForwardKernelArgs args) {
 
         load_V(kv_id);
 
-        // KV_calc_fragments = 8
-        copy_warp_fragment_SM2RF<KV_calc_fragments, MMA_LOAD_FRAGMENTS, D_HEAD, value_t>(
-                    rfmatrix_K.data(), smem_K, lane_id);
-        
-        // TODO: MMA S = Q @ K.T
-        // matmul<Kernel::S_QK_GEMM>(Q, K, S_accum);
+        // MMA S = Q @ K.T
+        // loop - d_head / 8 for QK^T
+        #pragma unroll
+        for (int k = 0; k < KV_calc_fragments; k += MMA_LOAD_FRAGMENTS) {
+            // Load a sub-tile of Q along k-dimension as MMA_LOAD_FRAGMENTS
+            // QO_fragments_per_warp = 2
+            copy_warp_fragment_SM2RF<QO_fragments_per_warp, MMA_LOAD_FRAGMENTS, D_HEAD, value_t>(
+                        rfmatrix_Q.data(), smem_Q + QO_warp_seq * D_HEAD, lane_id, k);
 
-        //         template <typename GEMM>
-        // __device__ constexpr void matmul(typename GEMM::A_t &A, typename GEMM::B_t &B,
-        //                                 typename GEMM::C_t &C) {
-        //     // If ::load_entire_block_into_rf is set for either A_t or B_t, then
-        //     // we assume the block has already been loaded.
-        //     using A_t = typename GEMM::A_t; // Q or P
-        //     using B_t = typename GEMM::B_t; // K or V
-        
-        //     constexpr int fragments_per_iter = 2;
-        
-        //     // GEMM::TotalKFragments is
-        //     // - d_head / 8 for QK^T
-        //     // - B_c / 8    for PV
-        //     #pragma unroll
-        //     for (int k = 0; k < GEMM::TotalKFragments; k += fragments_per_iter) {
-        //         // Load fragments along K dimension (2 at a time)
-        //         // Q is pre-loaded, P is computed in RF - only load if needed
-        //         if constexpr (!A_t::load_entire_block_into_rf) {
-        //             A.copy_SM2RF(k);  // Load Q fragments from SMEM
-        //         }
-        //         // Always load K/V fragments from SMEM (2 fragments per iteration)
-        //         B.copy_SM2RF(k);
-        
-        //         // Calculate column offsets for accessing the right fragment data
-        //         int A_col_offset = A_t::load_entire_block_into_rf ? k : 0;
-        //         int B_col_offset = B_t::load_entire_block_into_rf ? k : 0;
-                
-        //         // Perform outer product: each A row × each B column
-        //         // This gives optimal fragment reuse compared to row-by-row approach
-        //         warp_fragment_mma_f32_accum(A.data(), B.data(), C.data(),
-        //                                     A_col_offset, B_col_offset);
-        //     }
-        // }
+            // KV_calc_fragments = 8
+            copy_warp_fragment_SM2RF<KV_calc_fragments, MMA_LOAD_FRAGMENTS, D_HEAD, value_t>(
+                        rfmatrix_K.data(), smem_K, lane_id, k);
+            
+            warp_fragment_mma_f32_accum(rfmatrix_Q.data(), rfmatrix_K.data(), rfmatrix_S_accum.data(),
+                                        0, 0);
+        }
 
         // Wait untile tile V finishes transfering
         cp_async_wait<0>();
@@ -260,12 +232,19 @@ flash_forward_kernel(__grid_constant__ const ForwardKernelArgs args) {
 
         // ...
 
-        // KV_calc_fragments = 8 -> MMA_LOAD_FRAGMENTS
-        copy_warp_fragment_transposed_SM2RF<d_head_fragments, MMA_LOAD_FRAGMENTS, D_HEAD, value_t>(
-                    rfmatrix_V_T.data(), smem_V, lane_id);
+        // MMA O = P @ V
+        // loop - B_c / 8    for PV
+        #pragma unroll
+        for (int k = 0; k < d_head_fragments; k += MMA_LOAD_FRAGMENTS) {
+            // No need to load P as it's in RF
 
-        // 
-        // matmul<typename Kernel::O_PV_GEMM>(P_b16, V, O_accum);
+            // KV_calc_fragments = 8
+            copy_warp_fragment_transposed_SM2RF<d_head_fragments, MMA_LOAD_FRAGMENTS, D_HEAD, value_t>(
+                        rfmatrix_V_T.data(), smem_V, lane_id, k);
+            
+            warp_fragment_mma_f32_accum(rfmatrix_P_b16.data(), rfmatrix_V_T.data(), rfmatrix_O_accum.data(),
+                                        k, 0);
+        }
     }
 
     // O_b16.copy_RF2SM();
