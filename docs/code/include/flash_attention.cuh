@@ -8,6 +8,7 @@
 #include "common.h"
 #include "ldst.cuh"
 #include "ptx_functions.cuh"
+#include "calculate.cuh"
 
 
 namespace flash_practice {
@@ -70,6 +71,7 @@ flash_forward_kernel(__grid_constant__ const ForwardKernelArgs args) {
     using value_t = nv_bfloat16;
 
     constexpr int async = true;
+    constexpr bool optimized_softmax = true;
 
     const int sample = blockIdx.z;
     const int head = blockIdx.y;
@@ -112,7 +114,6 @@ flash_forward_kernel(__grid_constant__ const ForwardKernelArgs args) {
     // The number of d_head tiles loaded and operated on by this thread
     // block.
     constexpr int d_head_fragments = D_HEAD / COLS_PER_FRAGMENT;
-    constexpr int d_head_accum_regs = d_head_fragments * N_REGS_PER_F32_ACCUM_FRAGMENT;
 
     // each warp holds a sub-tile (B_r / NUM_WARPS, D_HEAD) of Q 
     // while sharing entire tile (B_c, D_HEAD) of K & V
@@ -123,7 +124,6 @@ flash_forward_kernel(__grid_constant__ const ForwardKernelArgs args) {
     // d_head), but perform computations on the entire block loaded by the
     // thread-block.
     constexpr int KV_calc_fragments = B_c / ROWS_PER_FRAGMENT;
-    constexpr int KV_calc_accum_regs = KV_calc_fragments * N_REGS_PER_F32_ACCUM_FRAGMENT;
     constexpr int KV_ldst_fragments_per_warp = KV_calc_fragments / NUM_WARPS;
     constexpr int KV_ldst_rows_per_warp = KV_ldst_fragments_per_warp * ROWS_PER_FRAGMENT;
 
@@ -134,9 +134,9 @@ flash_forward_kernel(__grid_constant__ const ForwardKernelArgs args) {
     RFMatrix<value_t, n_copies, KV_calc_fragments, MMA_LOAD_FRAGMENTS> rfmatrix_K;
     RFMatrix<value_t, n_copies, d_head_fragments, MMA_LOAD_FRAGMENTS> rfmatrix_V_T;
 
-    RFMatrix<accum_t, 1, QO_fragments_per_warp, KV_calc_accum_regs> rfmatrix_S_accum;
+    RFMatrix<accum_t, 1, QO_fragments_per_warp, KV_calc_fragments> rfmatrix_S_accum;
     RFMatrix<value_t, 1, QO_fragments_per_warp, KV_calc_fragments> rfmatrix_P_b16;
-    RFMatrix<accum_t, 1, QO_fragments_per_warp, d_head_accum_regs> rfmatrix_O_accum;
+    RFMatrix<accum_t, 1, QO_fragments_per_warp, d_head_fragments> rfmatrix_O_accum;
     RFMatrix<value_t, 1, QO_fragments_per_warp, d_head_fragments> rfmatrix_O_b16;
 
     const int QO_warp_seq = QO_rows_per_warp * warp_rank;
@@ -175,7 +175,8 @@ flash_forward_kernel(__grid_constant__ const ForwardKernelArgs args) {
     rfmatrix_O_accum.zero();
 
     // Initialize softmax_scale, m, and l.
-    const accum_t softmax_scale = rsqrt(static_cast<accum_t>(D_HEAD));
+    const accum_t softmax_scale = rsqrt(static_cast<accum_t>(D_HEAD)) *
+                                  (optimized_softmax ? M_LOG2E : 1.0);
     constexpr accum_t neg_inf = -cuda::std::numeric_limits<float>::infinity();
     accum_t m[QO_fragments_per_warp];
     accum_t l[QO_fragments_per_warp];
@@ -214,7 +215,7 @@ flash_forward_kernel(__grid_constant__ const ForwardKernelArgs args) {
             copy_warp_fragment_SM2RF<KV_calc_fragments, MMA_LOAD_FRAGMENTS, D_HEAD, value_t>(
                         rfmatrix_K.data(), smem_K, lane_id, k);
             
-            warp_fragment_mma_f32_accum(rfmatrix_Q.data(), rfmatrix_K.data(), rfmatrix_S_accum.data(),
+            warp_fragment_mma_f32_accum<value_t>(rfmatrix_Q.data(), rfmatrix_K.data(), rfmatrix_S_accum.data(),
                                         0, 0);
         }
 
@@ -226,11 +227,19 @@ flash_forward_kernel(__grid_constant__ const ForwardKernelArgs args) {
 
         // Online softmax
         
-        // ...
-
+        accum_t m_next[QO_fragments_per_warp];
+        if constexpr (!optimized_softmax) {
+            scale_S_accum(rfmatrix_S_accum.data(), softmax_scale);
+        }
+        calc_row_max(rfmatrix_S_accum.data(), m_next, m);
+        scale_l_O<optimized_softmax>(m_next, m, l, rfmatrix_O_accum.data(),
+                                             softmax_scale);
+        exponentiate_tensor<optimized_softmax>(rfmatrix_S_accum.data(), m_next,
+                                                       softmax_scale);
+        update_row_exp_sum(rfmatrix_S_accum.data(), l);
+ 
         // Convert the S accumulator block into P bf16/fp16 input block.
-
-        // ...
+        convert_to_16_bit_dtype<value_t>(rfmatrix_S_accum.data(), rfmatrix_P_b16.data());
 
         // MMA O = P @ V
         // loop - B_c / 8    for PV
@@ -242,7 +251,7 @@ flash_forward_kernel(__grid_constant__ const ForwardKernelArgs args) {
             copy_warp_fragment_transposed_SM2RF<d_head_fragments, MMA_LOAD_FRAGMENTS, D_HEAD, value_t>(
                         rfmatrix_V_T.data(), smem_V, lane_id, k);
             
-            warp_fragment_mma_f32_accum(rfmatrix_P_b16.data(), rfmatrix_V_T.data(), rfmatrix_O_accum.data(),
+            warp_fragment_mma_f32_accum<value_t>(rfmatrix_P_b16.data(), rfmatrix_V_T.data(), rfmatrix_O_accum.data(),
                                         k, 0);
         }
     }

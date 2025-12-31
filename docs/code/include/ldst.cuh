@@ -236,4 +236,30 @@ __forceinline__ __device__ constexpr void copy_warp_fragment_transposed_SM2RF(
     }
 }
 
+
+template <typename value_t, int M_fragments, int N_fragments>
+__forceinline__ __device__ constexpr void
+convert_to_16_bit_dtype(
+	float (&src_float)[M_fragments][N_fragments * 2],
+    uint32_t (&dest_uint)[M_fragments][N_fragments]) {
+    using value2_t =
+        std::conditional_t<std::is_same_v<value_t, half>, half2, nv_bfloat162>;
+ 
+    float2(&src)[M_fragments][N_fragments] =
+        reinterpret_cast<float2(&)[M_fragments][N_fragments]>(src_float);
+    value2_t(&dest)[M_fragments][N_fragments] =
+        reinterpret_cast<value2_t(&)[M_fragments][N_fragments]>(dest_uint);
+    #pragma unroll
+    for (int m = 0; m < M_fragments; ++m) {
+        #pragma unroll
+        for (int n = 0; n < N_fragments; ++n) {
+            if constexpr (std::is_same_v<value_t, half>) {
+                dest[m][n] = __float22half2_rn(src[m][n]);
+            } else {
+                dest[m][n] = __float22bfloat162_rn(src[m][n]);
+            }
+        }
+    }
+}
+
 } // flash_practice
