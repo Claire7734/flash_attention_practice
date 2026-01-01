@@ -70,7 +70,7 @@ flash_forward_kernel(__grid_constant__ const ForwardKernelArgs args) {
     using index_t = int64_t;
     using value_t = nv_bfloat16;
 
-    constexpr int async = true;
+    // constexpr int async = true;
     constexpr bool optimized_softmax = true;
 
     const int sample = blockIdx.z;
@@ -256,9 +256,17 @@ flash_forward_kernel(__grid_constant__ const ForwardKernelArgs args) {
         }
     }
 
-    // O_b16.copy_RF2SM();
-    // __syncwarp();
-    // O_b16.copy_SM2GM();
+    final_softmax_normalization(rfmatrix_O_accum.data(), l);
+    convert_to_16_bit_dtype<value_t>(rfmatrix_O_accum.data(), rfmatrix_O_b16.data());
+
+    copy_warp_fragment_RF2SM<QO_fragments_per_warp, d_head_fragments, D_HEAD, value_t>(
+                rfmatrix_O_b16.data(), smem_Q + QO_warp_seq * D_HEAD, lane_id);
+    __syncwarp();
+    copy_block_GSM<SM2GM<value_t>, QO_fragments_per_warp, D_HEAD, value_t>(
+        gmem_O, 
+        smem_O + QO_warp_seq * D_HEAD, 
+        gmem_seq_stride, 
+        lane_id);
 }
 
 } // flash_practice

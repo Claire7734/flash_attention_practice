@@ -165,4 +165,27 @@ update_row_exp_sum(
     }
 }
 
+template <int QO_fragments, int d_head_accum_fragments,
+          typename accum_t = float>
+__forceinline__ __device__ constexpr void final_softmax_normalization(
+    accum_t (&O_accum)[QO_fragments][d_head_accum_fragments],
+    accum_t (&l)[QO_fragments]
+) {
+    // Finish summing row_sums across all threads in the same row.
+    #pragma unroll
+    for (int q = 0; q < QO_fragments; ++q) {
+        l[q] += __shfl_xor_sync(SHFL_ENTIRE_WARP_MASK, l[q], 2);
+        l[q] += __shfl_xor_sync(SHFL_ENTIRE_WARP_MASK, l[q], 1);
+    }
+ 
+    // Final row-wise O softmax normalization.
+    #pragma unroll
+    for (int q = 0; q < QO_fragments; ++q) {
+        #pragma unroll
+        for (int d_head = 0; d_head < d_head_accum_fragments; ++d_head) {
+            O_accum[q][d_head] /= l[q];
+        }
+    }
+}
+
 } // flash_practice

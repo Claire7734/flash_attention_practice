@@ -154,6 +154,42 @@ __forceinline__ __device__ constexpr void copy_warp_fragment_SM2RF(
     }
 }
 
+// O
+template <int ROW_FRAGMENTS, int COL_FRAGMENTS, int SMEM_COL, typename value_t>
+__forceinline__ __device__ constexpr void copy_warp_fragment_RF2SM(
+    uint32_t (&regs)[ROW_FRAGMENTS][COL_FRAGMENTS],
+    value_t *smem,
+    const int lane_id
+) {
+    constexpr int rows_per_iter = ROWS_PER_FRAGMENT;
+    constexpr int col_fragments_per_iter = 1;
+    constexpr int col_fragments = SMEM_COL / ELEMS_PER_VEC4_ACCESS;
+ 
+    constexpr int elems_per_store = 2;
+    const int thread_row = lane_id / 4;
+    const int thread_inner_col = (lane_id % 4) * elems_per_store;
+ 
+    #pragma unroll
+    for (int r = 0; r < ROW_FRAGMENTS; ++r) {
+        const int cur_row = thread_row + r * rows_per_iter;
+        #pragma unroll
+        for (int c = 0; c < COL_FRAGMENTS; c += col_fragments_per_iter) {
+            // Apply swizzling to maintain consistent layout for later SMEM→GMEM transfers
+            const int smem_col_fragment =
+                get_smem_col_fragment<col_fragments>(
+                    cur_row, c);
+ 
+            // reinterpret_cast<uint32_t *>(
+            //     &smem[cur_row * CFG.smem_cols +
+            //           smem_col])[0] = regs[r][c];
+            reinterpret_cast<uint32_t *>(
+                &smem[cur_row * SMEM_COL +
+                      (smem_col_fragment * ELEMS_PER_VEC4_ACCESS +
+                       thread_inner_col)])[0] = regs[r][c];
+        }
+    }
+}
+
 // template <int ROW_FRAGMENTS, int COL_FRAGMENTS, int SMEM_COL, typename value_t>
 // __forceinline__ __device__ constexpr void copy_warp_fragment_SM2RF_optimized(
 //     uint32_t (&regs)[ROW_FRAGMENTS][COL_FRAGMENTS],
