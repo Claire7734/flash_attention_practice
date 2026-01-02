@@ -47,7 +47,7 @@ python tools/benchmark/pt_bench.py \
 
 python tools/benchmark/pt_bench.py \
                 --d_heads 128 \
-                --seq_lens=2048\
+                --seq_lens=4096\
                 --num_warmups 1 \
                 --num_repeats 2
 ```

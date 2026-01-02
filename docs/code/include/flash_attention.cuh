@@ -84,10 +84,6 @@ flash_forward_kernel(__grid_constant__ const ForwardKernelArgs args) {
     const index_t gmem_seq_stride = args.seq_stride;
 
     const int num_kv_iter = args.n_KV_blocks;
- 
-    // const auto batch_stride = TQ.stride(0);
-    // const auto seq_stride = TQ.stride(1);
-    // const auto head_stride = TQ.stride(2);
 
     const index_t sample_head_offset =
         sample * args.batch_stride + head * args.head_stride;
@@ -98,10 +94,10 @@ flash_forward_kernel(__grid_constant__ const ForwardKernelArgs args) {
     // We read the entire key sequence.
     const index_t KV_gmem_block_offset = sample_head_offset; // each segment advances BLOCK_KV * gmem_seq_stride
 
-    value_t *gmem_Q = &static_cast<nv_bfloat16*>(args.Q)[QO_gmem_block_offset];
-    value_t *gmem_K = &static_cast<nv_bfloat16*>(args.K)[KV_gmem_block_offset];
-    value_t *gmem_V = &static_cast<nv_bfloat16*>(args.V)[KV_gmem_block_offset];
-    value_t *gmem_O = &static_cast<nv_bfloat16*>(args.O)[QO_gmem_block_offset];
+    value_t *gmem_Q = &static_cast<value_t *>(args.Q)[QO_gmem_block_offset];
+    value_t *gmem_K = &static_cast<value_t *>(args.K)[KV_gmem_block_offset];
+    value_t *gmem_V = &static_cast<value_t *>(args.V)[KV_gmem_block_offset];
+    value_t *gmem_O = &static_cast<value_t *>(args.O)[QO_gmem_block_offset];
 
     // shared memory
     extern __shared__ __align__(16) char ch_smem[];
@@ -205,7 +201,7 @@ flash_forward_kernel(__grid_constant__ const ForwardKernelArgs args) {
         // MMA S = Q @ K.T
         // loop - d_head / 8 for QK^T
         #pragma unroll
-        for (int k = 0; k < KV_calc_fragments; k += MMA_LOAD_FRAGMENTS) {
+        for (int k = 0; k < d_head_fragments; k += MMA_LOAD_FRAGMENTS) {
             // Load a sub-tile of Q along k-dimension as MMA_LOAD_FRAGMENTS
             // QO_fragments_per_warp = 2
             copy_warp_fragment_SM2RF<QO_fragments_per_warp, MMA_LOAD_FRAGMENTS, D_HEAD, value_t>(
@@ -223,7 +219,8 @@ flash_forward_kernel(__grid_constant__ const ForwardKernelArgs args) {
         cp_async_wait<0>();
         __syncthreads();
 
-        load_K(kv_id + 1);
+        if (kv_id + 1 < num_kv_iter)
+            load_K(kv_id + 1);
 
         // Online softmax
         
@@ -244,7 +241,7 @@ flash_forward_kernel(__grid_constant__ const ForwardKernelArgs args) {
         // MMA O = P @ V
         // loop - B_c / 8    for PV
         #pragma unroll
-        for (int k = 0; k < d_head_fragments; k += MMA_LOAD_FRAGMENTS) {
+        for (int k = 0; k < KV_calc_fragments; k += MMA_LOAD_FRAGMENTS) {
             // No need to load P as it's in RF
 
             // KV_calc_fragments = 8
