@@ -138,13 +138,13 @@ Online softmax的算法由[Online normalizer calculation for softmax](https://ar
 
 比如针对safe softmax的计算公式：当前序列长度为`N`，当增加一个元素`x_k`时，此时的`x_max`有两个结果，要么是原来的最大值，要么是`x_k`。把前N个元素的最大值记为`m_N`，前N个元素的softmax的分母 $\sum_{j=0}^{N-1} \exp(x_j - x_{max})$ 记为`d_N`，那么，
 
-N+1个元素的最大值 $m_{N+1}$ 为：
+N + 1 个元素的最大值 $m_{N+1}$ 为：
 
 $$
 m_{N+1} = \max(m_N, x_N)
 $$
 
-N+1个元素的全局最大值 $d_{N+1}$ 为：
+N + 1 个元素的全局累加值，也即softmax的分母 $d_{N+1}$ 为：
 
 $$
 \begin{aligned}
@@ -155,12 +155,12 @@ d_{N+1} &= \sum_{j=0}^{N} \exp(x_j - m_{N+1}) \\
 \end{aligned}
 $$
 
-可以看出，全局最大值需要在原来的`d_N`基础上补乘一个系数 $\exp(m_N - m_{N+1})$ 做归一化调整；当全局最大值不变时，系数为1。再加上新元素的对应的分量 $\exp(x_N - m_{N+1})$ 。
+可以看出，全局累加值 $d_{N+1}$ 需要在原来的 $d_N$ 基础上补乘一个系数 $\exp(m_N - m_{N+1})$ 做归一化调整：当全局最大值不变时，系数为1；再加上新元素的对应的分量 $\exp(x_N - m_{N+1})$ 。
 
 
 #### Flash Attention-2 forward pass
 
-Online softmax处理的是一个序列x，而在Attention使用softmax计算注意力分数时，处理的是多个向量组成的**矩阵**。也就是说，针对每个查询向量（即Q的每一行），需要计算其与所有键（K的所有行 `[seq_len, d_head]`矩阵）的注意力权重，然后对值（V）加权求和。
+Online softmax算法处理的是一个**序列**，而Attention使用softmax计算注意力分数时，处理的是多个向量组成的**矩阵**。也就是说，注意力分数针对每个查询向量（即Q的每一行），计算其与所有键（K的所有行 `[kv_seq_len, d_head]`矩阵）的注意力权重。由此，每个查询对应了一个(1, kv_seq_len)的注意力分数向量。
 
 ```
 # attention state
@@ -194,17 +194,17 @@ tile_O /= sumexp.unsqueeze(-1)
 上面是Flash Attention-2的pseudo-Python代码，在内层循环中，每个查询位置（每行）独立计算自己的softmax。对于查询块`i`中的单个查询`q`，针对KV块`j`中的单个键`k`:
 
 $$
-S_{i,q,k}^{(j)} = Q_i[q]·K_j[k]^T / sqrt(d)
+S_{i,q}^{(j,k)} = Q_i[q]·K_j[k]^T / sqrt(dim)
 $$
 
 $$
-m_q^{(j)} = max(m_q^{(j-1)}, maxoverk(S_{i,q,k}^{(j)}))
+m_q^{(j)} = max(m_q^{(j-1)}, maxoverk(S_{i,q}^{(j,k)}))
 $$
 
 运行时分母为：
 
 $$
-l_q^{(j)} = exp(m_q^{(j-1)} - m_q^{(j)}) * l_q^{(j-1)} + sumoverk(exp(S_{i,q,k}^{(j)} - m_q^{(j)}))
+l_q^{(j)} = exp(m_q^{(j-1)} - m_q^{(j)}) * l_q^{(j-1)} + sumoverk(exp(S_{i,q}^{(j,k)} - m_q^{(j)}))
 $$
 
 ### 算法实现
