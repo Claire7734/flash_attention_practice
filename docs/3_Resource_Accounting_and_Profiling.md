@@ -11,21 +11,27 @@
 对于Attention layer，下面是基于Flash Attention的resource的粗略计算，这里忽略了softmax的flops。
 
 Initial stats:
+
   `flops = 0`
+
   `bytes_transferred = 0`
 
 1. 从HBM中读取 Q (B x T x D), K (B x S x D), V (B x S x D)，half精度，占用2B
    `bytes_transferred = 2*B*T*D + 2*B*S*D + 2*B*S*D`
-2. 计算 S () = Q (B x T x D) @ K (B x S x D)
+2. 计算 S = Q (B x T x D) @ K (B x S x D)
     `flops += 2*B*S*T*D`
 3. 计算 O = softmax(S) (B x S x T x K x G) @ V (B x S x K x H)
     `flops += 2*B*S*T*D`
 4. 写入 O 到HBM
     `bytes_transferred += 2*B*T*D`
 
-最后：`flops == 4*B*S*T*D`, `bytes_transferred == 4*B*S*D + 4*B*T*D`
+最后：
 
-`arithmetic_intensity = S*T/(S + T)`
+`flops == 4*B*S*T*D`, 
+
+`bytes_transferred == 4*B*S*D + 4*B*T*D`
+
+故，`arithmetic_intensity = S * T/(S + T)`
 
 对于Prefill阶段来说，通常T = S，`intensity = S/2`；对于decode阶段来说，T = 1，意味着`intensity = 1`，严重memory-bound。
 
@@ -44,7 +50,7 @@ Ampere GPUs A100和RTX 3090的性能指标如下：
 | NVIDIA A100 | 311.84 | 1.94 | 311.84e12 / 1.94e12 | ≈ 160.74 |
 | NVIDIA RTX 3090 | 71 | 0.9362 | 71e12 / 0.9362e12 | ≈ 75.84 |
 
-根据Attention的Prefill阶段的`intensity = S/2`，可以推算出hit GMEM roofline的序列长度。
+根据Attention的Prefill阶段的`intensity = S/2`，可以估算出hit GMEM roofline的序列长度。
 
 
 ### 一个Attention tile的 Resource Accounting
@@ -78,15 +84,15 @@ def arithmetic_intensity(B_r, B_c, kv_seq_len, d_head) -> float:
  
 ```
 
-算术强度的上限是当kv_seq_len趋向于无穷大，此时的推导公式如下，上限近似等于$B_r$。
+算术强度的上限是当kv_seq_len趋向于无穷大，此时的推导公式如下，上限近似等于 $B_r$。
 
 $$
-\text{AI}_{\max} \approx B_r \times \left( 1 + \frac{1}{d\_head} + \frac{1}{4 B\_c} + \frac{1}{d\_head \cdot B\_c} \right)
+\text{AI}_{\max} \approx B_r \times \left( 1 + \frac{1}{d\_{head}} + \frac{1}{4 B\_c} + \frac{1}{d\_{head} \cdot B\_c} \right)
 $$
 
-当`kv_seq_len = 4096, B_r = 64, B_c = 64, d_head = 128`时，arithmetic intensity为~64；当`kv_seq_len = 4096, B_r = 128, B_c = 64, d_head = 128`时，arithmetic intensity为~129。
+当`kv_seq_len = 4096, B_r = 64, B_c = 64, d_head = 128`时，arithmetic intensity为\~64；当`kv_seq_len = 4096, B_r = 128, B_c = 64, d_head = 128`时，arithmetic intensity为\~129。
 
-可以看出，在RTX3090上，B_r = 64时，arithmetic intensity为~64，接近Accelerator Intensity 75；在A100上，B_r = 128时，arithmetic intensity为~129，接近Accelerator Intensity 160.74。
+可以看出，在RTX3090上，B_r = 64时，arithmetic intensity为\~64，接近Accelerator Intensity 75；在A100上，B_r = 128时，arithmetic intensity为\~129，接近Accelerator Intensity 160.74。
 
 
 ### Kernel 1的资源计算
@@ -95,10 +101,13 @@ $$
 
 * Basic: 4 warps for each CTA for a total of 128 threads
 * Threads per CTA
+  
   SM_86 支持每个SM最高1536个thread，因此在这个kernel中，每个SM最高可以有1536/128 = 12 CTAs，不会成为瓶颈
 * Registers per Thread
+  
   SM_86上，每个SM有65536个register。每个thread最多访问255个register。在kernel 1版本中，一共用了202个 register，那么`65536/202 ~= 324 threads ~= 8 warps ~= 2 CTAs per SM`
 * Shared Memory per CTA
+  
   SM_86上，每个SM有99KiB的SMEM，基于`B_r = 64, B_c = 64, d_head = 128`：
     * Q 和 O：`B_r x d_head x sizeof(value_t) = 16KiB`
     * K 和 V：`B_c x d_head x sizeof(value_t) = 16KiB`
@@ -116,22 +125,23 @@ $$
 
 ### Compute Pipeline
 
-在Profiling Kernel 7在RTX3090和A100的表现之后，一个显著的不同是Kernel 7的scalar pipelines远多于reference kernel。
+Profile Kernel 7在A100的表现之后，一个显著的不同是Kernel 7的scalar pipelines远多于reference kernel。
 
 ![alt text](image-47.png)
 ![alt text](image-48.png)
 
 检查SASS instruction后，围绕地址计算的instruction过多，罪魁祸首是最初版本的swizzle算法，详细解决方案见[数据访问与Swizzling](./1_数据访问与Swizzling.md)。
 
-  IMAD: integer multiply-add
-  LOP3.LUT: bitwise logic operation with 3 operands
-  MOV: register copy
-  SHF: bit shift
+> * IMAD: integer multiply-add
+> * LOP3.LUT: bitwise logic operation with 3 operands
+> * MOV: register copy
+> * SHF: bit shift
 
 ![alt text](image-49.png)
 
 * Why the A100 Suffers: Throughput Ratios
-  但为什么A100更受影响？原因在于mma / FP32 ratio。A100的ratio是16x，而RTX3090是2x。由于RTX3090执行mma比较慢，数据搬得满影响也不大。
+  
+  原因在于mma / FP32 ratio：A100的ratio是16x，而RTX3090是2x。由于RTX3090执行mma比较慢，即使数据搬得慢，影响也更小。
   
 ### Block Size Limitations
 
@@ -149,13 +159,16 @@ $$
 #### Metrics to check
 
 * Bank Conflicts
+  
   Double check `derived__memory_l1_wavefronts_shared_excessive`, = `memory_l1_wavefronts_shared - memory_l1_wavefronts_shared_ideal`
 
 * Memory Utilization
+  
   `l1tex__data_pipe_lsu_wavefronts_mem_shared_op_ld.sum.pct_of_peak_sustained_elapsed`, i.e.
   ![alt text](image-50.png)
 
 * [Warp Stalls](https://lubits.ch/flash/Part-4#warp-stalls)
+  
   `smsp__pcsamp_warps_issue_stalled_*` metrics
     * `smsp__pcsamp_warps_issue_stalled_selected`: success
     * `..._not_selected`: another warp is chosen instead
@@ -169,5 +182,6 @@ $$
     详细可参考[Nsight Compute documentation](https://docs.nvidia.com/nsight-compute/ProfilingGuide/index.html#id33)。
 
 * Register Pressure
+  
   [nvcc Flags for Register Spilling](https://lubits.ch/flash/Appendix#nvcc-flags-for-register-spilling)
   Cause: 当RF不够大时，compiler会spill register value to LMEM (L1 -> L2 -> DRAM)。

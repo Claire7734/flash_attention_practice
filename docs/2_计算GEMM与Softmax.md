@@ -24,10 +24,10 @@ $$
 
 那么如果要完成[数据访问与Swizzling](./1_数据访问与Swizzling.md)中，从smem搬运到RF上的数据，对应的迭代次数如下：
 
-|     | A         | A Shape (Registers) | B               | B Shape (Registers) | Iteration Shape (k, m, n) |
-|-----|-----------|---------------------|-----------------|---------------------|---------------------------|
-|     | Q         | (2, 16)             | KT              | (8, 16)             | (8, 1, 8)                 |
-|     | P         | (2, 8)              | Vj (transposed) | (16, 8)             | (4, 1, 16)                |
+| A         | A Shape (Registers) | B               | B Shape (Registers) | Iteration Shape (k, m, n) |
+|-----------|---------------------|-----------------|---------------------|---------------------------|
+| Q         | (2, 16)             | KT              | (8, 16)             | (8, 1, 8)                 |
+| P         | (2, 8)              | Vj (transposed) | (16, 8)             | (4, 1, 16)                |
 
 ### 沿着k维度切分计算任务
 
@@ -55,14 +55,14 @@ Cutlass GEMM关于K维度的优化策略，主要是针对m/n维度较小而k维
 > 
 > split-K: reduction across CTAs
 
-总体来说，sliced-k发生在一个SM上，因此可以通过shared memory进行结果的同步，比如依靠shared memory的一个partial accumulation sums累加结果；而split-K由于设计到跨SM的数据同步，有一些更复杂的规约策略。
+总体来说，sliced-k发生在一个SM上，因此可以通过shared memory进行结果的同步，比如依靠shared memory的一个partial accumulation sums累加结果；而split-K由于涉及到跨SM的数据同步，有一些更复杂的规约策略。
 
 细节请参考[cutlass GEMM——sliced-K、split-K & stream-K 分析 （一）](https://zhuanlan.zhihu.com/p/713411778)
 
 
 #### 应用在本案中
 
-本案的任务相对而言更直观，是在一个warp内部进行reduce的，所以可以复用MMA的C&D的寄存器累加结果，完成在RF上的规约。
+本案的任务相对而言更直观，是在一个warp内部进行reduce的，所以可以复用MMA的C&D的寄存器累加结果，完成在RF上的归约。
 
 由此，Q, Kj和Vj的RF shape可以进一步削减为下表。Q, Kj 和Vj的每个slice包含2个fragments，也就是16个元素的宽度，这也是`ldmatrix`的加载宽度。
 
@@ -162,6 +162,8 @@ $$
 
 Online softmax算法处理的是一个**序列**，而Attention使用softmax计算注意力分数时，处理的是多个向量组成的**矩阵**。也就是说，注意力分数针对每个查询向量（即Q的每一行），计算其与所有键（K的所有行 `[kv_seq_len, d_head]`矩阵）的注意力权重。由此，每个查询对应了一个(1, kv_seq_len)的注意力分数向量。
 
+在Flash Attention的分块处理任务中，每次循环会处理当前Qi块对应的B_c个键值对，因此，对应的max和sum都是以B_c为单位做的增量处理。
+
 ```
 # attention state
 m = torch.zeros(BLOCK_Q)
@@ -224,7 +226,11 @@ $$
         * `mask`: 指定参与交换的线程
     * Reduction：
     
-      如下图所示，一个warp处理一个(8, 8)shape的fragment，每行由4个线程处理。Reduction需要让这4个thread充分同步数据。使用异或操作，两两间进行一次信息交换，最小沟通次数为`4 = 2^2`，即2次。
+      如下图所示，一个warp处理一个(8, 8)shape的fragment，每行对应一个Query，由4个线程处理。由Reduction需要让这4个thread充分同步数据。使用异或操作，两两间进行一次信息交换，最小沟通次数为`4 = 2^2`，即2次。
+
+      ![alt text](image-53.png)
+
+      即：
 
       ![alt text](image-41.png)
 
@@ -251,3 +257,14 @@ $$
 1. 将计算注意力分数的scale运算，逐元素乘系数 $\alpha = 1/\sqrt{d_{head}}$，放进Safe attention减去最大值的操作 $S_{i}^{(j)} - m^{(j)}$里，变成 $\alpha⋅S_{i}^{(j)} - \tilde{m}^{(j)}$，其中 $\tilde{m}^{(j)} = \alpha⋅m^{(j)}$
    
 2. 将`expf(x)`显示地改写成更快的`exp2f(x * log2e)`( $e^{x} = 2^{x \cdot \log_{2}e}$ )，并提前把常数`log2e`合并到 $\alpha$中。更新后， $\alpha = \log_{2}e/\sqrt{d_{head}}$。
+
+
+> 详细计算过程可参考[Fusing FP Multiplication and Addition in Softmax](https://lubits.ch/flash/Part-6#fusing-fp-multiplication-and-addition-in-softmax):
+> 
+> Softmax计算原始版：完成一个KV tile的计算需要 `W_r(5.5W_c + W_d + 6)` instructions
+> 
+> ![alt text](image-54.png)
+> 
+> Softmax优化版：完成一个KV tile的计算需要 `W_r(4.5W_c + W_d + 8)` instructions
+> 
+> ![alt text](image-55.png)

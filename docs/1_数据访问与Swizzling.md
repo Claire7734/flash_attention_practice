@@ -28,10 +28,16 @@ Flash Attention 2 算法定义如下：
 `.row.col`：分别表示矩阵A按照row-major存储，矩阵B按colomn-major存储。`m16n8k16`指令只支持这一种类型。
 
 A矩阵，行主序：
+
 ![alt text](image-2.png)
 
 B矩阵，列主序：
-![alt text](image-3.png)
+
+![alt text](image-51.png)
+
+CD矩阵，行主序：
+
+![alt text](image-52.png)
 
 如上图所示，`m16n8k16`在进行运算时，需要A矩阵按row-major存储，B矩阵按colomn-major存储。那么，当输入的所有矩阵都是row-major存储时，对B来说，colomn-major的访问方式相当于做了一次转置。因此，当A和B矩阵都是row-major的话，`m16n8k16`完成的运算其实是`D = AB^T + C`。但这引入一个问题，虽然B矩阵内存储元素做了转置，但是维度仍然是(N, K)，怎么满足`m16n8k16`对B矩阵的维度为(K, N)的要求。
 
