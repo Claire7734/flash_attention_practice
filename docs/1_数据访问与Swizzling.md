@@ -513,11 +513,14 @@ bit[3:0]   - 16B块内字节偏移
 在实现中，本案使用了配置`CuteSwizzle<3, 3, log2(d_head) - log2(ELEMS_PER_VEC4_ACCESS)>;`
 
   1. BBits (mask_bits) = 3
+
      要操作的bit数量，`bit_mask = 0b111`：对应8个bank (2^3 = 8)
   2. MBase (mbase) = 3
+    
      掩码基地址的bit位置偏移：访问粒度和对齐调整
   3. SShift (mask_shift) = 4
-     右移的位数：确保正确对齐到bank索引进行异或
+     
+     右移的位数：行间偏移，即stride。`log2(d_head) - log2(ELEMS_PER_VEC4_ACCESS)`表示在连续内存中，移动到下一行需要跳过的宽度。
 
 
 ##### GMEM <-> SMEM
