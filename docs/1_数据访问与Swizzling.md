@@ -78,7 +78,11 @@ CD矩阵，行主序：
 ![alt text](image-10.png)
 
 
-## Flash Attention中的Q, K, V
+## Flash Attention v2中的Q, K, V
+
+GPU的内存架构如下。
+
+![alt text](image-17.png)
 
 数据搬运与计算任务沿着CTA -> warp -> thread分配，一个CTA包含4个warp，每个warp包含32个thread，所以一个CTA包含128个线程。
 
@@ -97,6 +101,11 @@ CD矩阵，行主序：
 
 任务以处理一个(Br, dhead)的Qi tile为单位，一共需要处理`batch_size * n_heads * Tr`个Qi tile。
 
+#### Flash Attention v2 v.s. Flash Attention v1
+
+Flash Attention v1在batch size和number of heads维度做了并行化。每个线程处理一个完整的attention head，计算任务大小为`bs * n_heads`。然而，当`bs * n_heads`比较小的时候，特别是bs为1的场景下，往往不能做到很好的并行化以充分利用硬件资源。
+
+Flash Attention v2在v1的基础上提出了在seq_len维度的并行化，将计算任务划分成以一个Q_i为粒度的Attention计算。这显著增强了任务数量，并且更适配长序列的场景。但由于以Q_i为粒度，对于相同bs和n_heads的所有`seq_len/B_r`个Q_i，理论上K和V都会被重复加载。为了更大程度地发挥数据局部性，利用GPU的L2 Cache，应当将相同bs和head的Q_i块一起launch。
 
 #### 工作组 CTA
 
@@ -133,10 +142,7 @@ CTA launch的顺序是：`blockIdx.x + blockIdx.y * gridDim.x + gridDim.x * grid
 
 ### Data movement strategy
 
-GPU的内存架构如下，需要完成数据在gmem <-> smem <-> RF中的搬运。
-
-![alt text](image-17.png)
-
+需要完成数据在gmem <-> smem <-> RF中的搬运。
 
 LDST操作整理：
 
