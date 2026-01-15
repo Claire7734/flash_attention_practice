@@ -85,7 +85,7 @@ Cutlass GEMM关于K维度的优化策略，主要是针对m/n维度较小而k维
 
 #### Double buffering
 
-根据上一节，一个GEMM沿着K维度被做了切分，切分宽度为`ldmatrix`的加载宽度，即16个元素。一个优化策略是做一个SMEM -> RF的double buffering，从而减少MMA的数据准备时间。
+根据上一节，一个GEMM沿着K维度被做了切分，切分宽度为`ldmatrix`的加载宽度，即16个元素。一个优化策略是做一个SMEM -> RF的double buffering，从而减少MMA的数据准备时间。虽然`ldmatrix`是一个sync指令，但这样做可以增加指令发射密度，同时减少寄存器的访问压力，从而最大化mma执行效率。
 
 ![alt text](image-39.png)
 
